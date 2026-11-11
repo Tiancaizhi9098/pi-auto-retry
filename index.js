@@ -4,10 +4,11 @@ import { isKeyRelease, matchesKey } from "@earendil-works/pi-tui";
 import { DEFAULT_LIMIT, parseLimit, readLimit, writeLimit } from "./preferences.js";
 import {
   buildSelfCheckPrompt,
+  collectStaleSelfCheckEdits,
   continuation,
   DELAY_MS,
+  pruneRuntimeMessages,
   retryPolicy,
-  sanitizeMessagesForNativeRetry,
   SELF_CHECK_TYPE,
   waitForDelay,
 } from "./retry.js";
@@ -21,6 +22,8 @@ export default function autoRetry(pi) {
   let limit = DEFAULT_LIMIT;
   let active;
   let nativeUsed = 0;
+  let filterHeat = 0;
+  let cleanTurns = 0;
   let dialogs = 0;
 
   pi.registerMessageRenderer(SELF_CHECK_TYPE, renderSelfCheckMessage);
@@ -64,7 +67,15 @@ export default function autoRetry(pi) {
 
   pi.on("session_start", (_event, ctx) => {
     reset();
+    filterHeat = 0;
+    cleanTurns = 0;
     dialogs = 0;
+    try {
+      const tail = (ctx.sessionManager?.getBranch?.() ?? []).slice(-12);
+      if (tail.some(e => e.type === "custom_message" && e.customType === SELF_CHECK_TYPE)) {
+        filterHeat = 1;
+      }
+    } catch {}
     try {
       limit = readLimit(path);
     } catch (error) {
@@ -72,7 +83,11 @@ export default function autoRetry(pi) {
       ctx.ui.notify("Could not read retry settings. Using 10 retries. " + error.message, "warning");
     }
   });
-  pi.on("session_shutdown", reset);
+  pi.on("session_shutdown", () => {
+    reset();
+    filterHeat = 0;
+    cleanTurns = 0;
+  });
   pi.on("before_agent_start", reset);
   pi.on("message_start", event => { if (event.message.role === "user") reset(); });
   pi.on("agent_settled", reset);
@@ -89,8 +104,9 @@ export default function autoRetry(pi) {
         const content = buildSelfCheckPrompt({
           attemptNumber: active.number,
           limit,
-          filterStreak: active.filterStreak,
+          filterHeat: active.filterHeat,
           clue: active.clue,
+          compacted: false,
           redactedTools: [],
           omittedTurnTools: [],
         });
@@ -101,9 +117,10 @@ export default function autoRetry(pi) {
           details: {
             attempt: active.number,
             limit,
-            filterStreak: active.filterStreak,
+            filterHeat: active.filterHeat,
             stage: active.clue?.stage ?? "request",
             reason: active.clue?.reason ?? "provider content filter",
+            compacted: false,
             redactedTools: [],
             omittedTurnTools: [],
           },
@@ -114,18 +131,39 @@ export default function autoRetry(pi) {
   });
 
   pi.on("context", event => {
-    if (!active?.running || !active.native || !active.selfCheck) return;
-    return { messages: sanitizeMessagesForNativeRetry(event.messages, active.filterStreak) };
+    const pruned = pruneRuntimeMessages(event.messages, {
+      nativeSelfCheck: Boolean(active?.running && active.native && active.selfCheck),
+      filterHeat: active?.filterHeat ?? filterHeat,
+    });
+    if (pruned) return { messages: pruned };
   });
 
   pi.on("turn_end", async (event, ctx) => {
     const policy = retryPolicy(event.message, ctx.model, pi.getSettings().retry, nativeUsed);
     const used = active?.number ?? 0;
-    const prevFilterStreak = active?.filterStreak ?? 0;
     const series = active?.series ?? Symbol();
     clearAttempt();
     if (!policy.retry || used >= limit || ctx.signal?.aborted) {
       nativeUsed = 0;
+      if (event.outcome === "completed") {
+        if (event.message?.stopReason === "stop") {
+          filterHeat = 0;
+          cleanTurns = 0;
+        } else {
+          cleanTurns++;
+          if (cleanTurns >= 2) {
+            filterHeat = Math.max(0, filterHeat - 1);
+            cleanTurns = 0;
+          }
+        }
+        // Durably omit self-check messages once a turn succeeds so they never accumulate in context.
+        if (!ctx.signal?.aborted && event.context?.contextEntries) {
+          const cleanupEdits = collectStaleSelfCheckEdits(event.context.contextEntries);
+          if (cleanupEdits.length > 0) {
+            return { entries: [...event.entries, ...cleanupEdits] };
+          }
+        }
+      }
       if (policy.retry && used && used >= limit && !ctx.signal?.aborted) {
         const suffix = policy.providerBlocked ? " The provider blocked this request." : "";
         ctx.ui.notify("Retry limit reached (" + used + "/" + limit + ")." + suffix, "warning");
@@ -134,13 +172,18 @@ export default function autoRetry(pi) {
       return;
     }
 
+    if (policy.selfCheck) {
+      filterHeat++;
+      cleanTurns = 0;
+    }
+
     const attempt = {
       number: used + 1,
       series,
       targetId: event.messageEntryId,
       turnToolResultIds: event.toolResultEntryIds ?? [],
       selfCheck: Boolean(policy.selfCheck),
-      filterStreak: policy.selfCheck ? prevFilterStreak + 1 : prevFilterStreak,
+      filterHeat,
       clue: policy.clue,
       ctx,
       native: policy.native,

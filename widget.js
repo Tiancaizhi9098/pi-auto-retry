@@ -51,9 +51,12 @@ export function renderSelfCheckMessage(message, options, theme) {
   const title = theme.fg("warning", bold(`[Auto-Retry · Filter Self-Check${badge}]`));
   const summary = [
     details.stage === "output"
-      ? "Reply stream hit provider filter; asking model to inspect & rephrase before retrying."
-      : "Request hit provider filter; asking model to inspect context/phrasing & retry.",
+      ? "Reply stream hit provider filter; adjusting reasoning/tool strategy before retrying."
+      : "Request hit provider filter; adjusting context/strategy before retrying.",
   ];
+  if (details.compacted) {
+    summary.push("Compacted earlier transcript history.");
+  }
   if (details.redactedTools?.length) {
     summary.push(`Folded tool output: ${details.redactedTools.join(", ")}.`);
   }

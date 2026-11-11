@@ -257,6 +257,7 @@ test("credentials, quota, invalid schema requests, and success settle immediatel
   for (const message of [
     failure("HTTP 401 invalid API key, connection error"),
     failure("429 insufficient_quota"),
+    failure("429: Antigravity: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h. (429: you can retry your request)"),
     failure("HTTP 400 invalid_request_error: missing required field"),
     success,
   ]) {
@@ -264,7 +265,7 @@ test("credentials, quota, invalid schema requests, and success settle immediatel
     await s.session.prompt("normal request");
     assert.equal(s.row(), "");
   }
-  assert.equal(s.calls.length, before + 4);
+  assert.equal(s.calls.length, before + 5);
   assert.equal(s.nativeStarts.length, 0);
 });
 
@@ -296,12 +297,57 @@ test("Gemini filter + Antigravity cutoff injects a visible self-check prompt bef
   const selfCheckText = JSON.stringify(selfCheckMsg.content);
   assert.match(selfCheckText, /Auto-Retry Filter Self-Check 1\/10/);
   assert.match(selfCheckText, /Gemini's content filter/);
-  assert.match(selfCheckText, /mid-generation \(reasoning\)/);
+  assert.match(selfCheckText, /mid-generation \(internal reasoning\)/);
 
-  // Persisted as a visible custom_message in session history.
+  // Persisted as a visible custom_message in session history, and omitted from future model context once recovered.
   const customEntries = s.session.sessionManager.getBranch().filter(e => e.type === "custom_message" && e.customType === "pi-auto-retry");
   assert.equal(customEntries.length, 1);
   assert.equal(customEntries[0].display, true);
+
+  await s.session.prompt("Follow-up request");
+  assert.equal(s.calls.length, 3);
+  assert.ok(!JSON.stringify(s.calls[2].messages).includes("Auto-Retry Filter Self-Check"));
+});
+
+test("bloated uncompacted history compacts on filter block while keeping recent clean tool snippets intact", async t => {
+  const bigDump = "OLD_LOW_LEVEL_TRACE_LINE\n".repeat(5000); // ~125 KB
+  const cleanSnippet = "def compile_cpp(sources, output):\n    return output\n";
+  let callNum = 0;
+  const readTool = {
+    name: "read",
+    label: "Read",
+    description: "Read file",
+    parameters: Type.Object({ path: Type.String() }),
+    async execute(_id, params) {
+      callNum++;
+      return {
+        content: [{ type: "text", text: params.path.includes("old") ? bigDump : cleanSnippet }],
+        details: {},
+      };
+    },
+  };
+  const s = await openSession(t, { tools: [readTool] });
+  s.reply = n => {
+    if (n === 1) return { stopReason: "toolUse", content: [{ type: "toolCall", id: "c_old", name: "read", arguments: { path: "src/old_trace.log" } }] };
+    if (n === 2) return { stopReason: "toolUse", content: [{ type: "toolCall", id: "c_clean", name: "read", arguments: { path: "scripts/toolchain.py" } }] };
+    if (n === 3) return failure(truncated, [{ type: "thinking", thinking: "Modifying toolchain." }, { type: "text", text: geminiFilterBanner }]);
+    return success;
+  };
+  const tick = clock(t);
+  const done = s.session.prompt("Update scripts/toolchain.py build step");
+  await until(() => s.row().includes("[1/10]"));
+  await tick(10000);
+  await done;
+
+  assert.equal(callNum, 2);
+  assert.equal(s.calls.length, 4);
+  const recoveredPayload = JSON.stringify(s.calls[3].messages);
+  // 125 KB old dump was compacted away into a neutral summary.
+  assert.ok(!recoveredPayload.includes("OLD_LOW_LEVEL_TRACE_LINE"));
+  assert.match(recoveredPayload, /compacted into a neutral software-engineering summary/);
+  assert.match(recoveredPayload, /src\/old_trace\.log/);
+  // Recent small clean toolchain.py snippet was preserved so the model doesn't loop re-reading it.
+  assert.ok(recoveredPayload.includes("def compile_cpp(sources, output):"));
 });
 
 test("consecutive Gemini filter blocks progressively fold raw tool outputs without breaking toolCall pairing", async t => {
