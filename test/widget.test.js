@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { TuiAltScreen } from "@earendil-works/pi-tui";
-import { retryWidget } from "../widget.js";
+import { renderSelfCheckMessage, retryWidget } from "../widget.js";
 
 test("Pi's fullscreen renderer routes terminal mouse clicks only inside [Cancel]", async t => {
   let input;
@@ -30,4 +30,38 @@ test("Pi's fullscreen renderer routes terminal mouse clicks only inside [Cancel]
   assert.equal(clicks, 0);
   click(11, 3);
   assert.equal(clicks, 1);
+});
+
+test("self-check retry widget and chat message renderer format collapsed and expanded states", () => {
+  const theme = {
+    fg: (_color, text) => text,
+    bg: (_color, text) => text,
+    bold: text => text,
+  };
+  const attempt = { number: 2, deadline: Date.now() + 9000, running: false, selfCheck: true };
+  const widget = retryWidget({ requestRender() {} }, theme, attempt, () => 10, () => {});
+  try {
+    assert.match(widget.render(80)[0], /^\[2\/10\]  \[Cancel\]  Filter blocked · self-check in \ds · Esc$/);
+    attempt.running = true;
+    assert.equal(widget.render(80)[0], "[2/10]  [Cancel]  Self-checking & retrying · Esc");
+  } finally {
+    widget.dispose();
+  }
+
+  const message = {
+    content: "Full self-check instruction body",
+    details: { attempt: 2, limit: 10, stage: "output", redactedTools: ["read"] },
+  };
+  const collapsed = renderSelfCheckMessage(message, {
+    expanded: false,
+    outputPad: 1,
+    keyHint: (_id, desc) => "ctrl+o " + desc,
+  }, theme).render(120).join("\n");
+  assert.match(collapsed, /\[Auto-Retry · Filter Self-Check 2\/10\]/);
+  assert.match(collapsed, /Folded tool output: read\./);
+  assert.match(collapsed, /\(ctrl\+o to expand\)/);
+  assert.ok(!collapsed.includes("Full self-check instruction body"));
+
+  const expanded = renderSelfCheckMessage(message, { expanded: true, outputPad: 1 }, theme).render(120).join("\n");
+  assert.match(expanded, /Full self-check instruction body/);
 });

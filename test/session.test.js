@@ -13,6 +13,7 @@ import { Type } from "typebox";
 const { AuthStorage } = await import(new URL("./core/auth-storage.js", import.meta.resolve("@earendil-works/pi-coding-agent")));
 const entry = process.env.PI_AUTO_RETRY_TEST_ENTRY || fileURLToPath(new URL("../index.js", import.meta.url));
 const truncated = "Antigravity: the reply ended before it was complete";
+const geminiFilterBanner = "This request was blocked by Gemini's filters. They can occasionally trigger by mistake on safe coding, security, or biology-related queries. Please try rephrasing your prompt. You can send feedback or read more about our policies here.";
 const failure = (errorMessage, content = []) => ({ stopReason: "error", errorMessage, content });
 const success = { stopReason: "stop", content: [{ type: "text", text: "done" }] };
 const turn = () => nextFrame();
@@ -52,7 +53,7 @@ async function openSession(t, options = {}) {
     async select(title, items) { state.menus.push({ title, items }); return state.choose?.(items); },
     async input() { return state.enter; },
   };
-  await session.bindExtensions({ mode: "interactive", uiContext: ui, onError: error => state.errors.push(error) });
+  await session.bindExtensions({ mode: options.mode ?? "tui", uiContext: ui, onError: error => state.errors.push(error) });
   session.subscribe(event => { if (event.type === "auto_retry_start") state.nativeStarts.push(event); });
   const mockStream = (model, context, streamOptions) => {
     state.calls.push({ time: Date.now(), messages: structuredClone(context.messages) });
@@ -250,39 +251,218 @@ test("a successful tool call is preserved when the next model stream fails", asy
   assert.equal(s.widget, undefined);
 });
 
-test("explicit provider rejections, credentials, and success settle immediately", async t => {
+test("credentials, quota, invalid schema requests, and success settle immediately", async t => {
   const s = await openSession(t);
   const before = s.calls.length;
   for (const message of [
-    failure(truncated, [{ type: "text", text: "This request was blocked by Gemini's filters." }]),
-    { ...failure("503 gateway"), rawStopReason: "SAFETY" },
-    failure("HTTP 401 invalid API key, connection error"), failure("429 insufficient_quota"), success,
+    failure("HTTP 401 invalid API key, connection error"),
+    failure("429 insufficient_quota"),
+    failure("HTTP 400 invalid_request_error: missing required field"),
+    success,
   ]) {
     s.reply = () => message;
     await s.session.prompt("normal request");
     assert.equal(s.row(), "");
   }
-  assert.equal(s.calls.length, before + 5);
+  assert.equal(s.calls.length, before + 4);
   assert.equal(s.nativeStarts.length, 0);
 });
 
-test("HTTP 200 with a Gemini block reports 0/20, while an ordinary stream cutoff retries", { timeout: 10000 }, async t => {
-  const times = [];
-  const blocked = "This request was blocked by Gemini's filters. Please try rephrasing your prompt.";
-  const server = createServer((req, res) => {
-    req.resume();
-    times.push(Date.now());
-    res.writeHead(200, { "Content-Type": "text/event-stream" });
-    const send = data => res.write("data: " + JSON.stringify(data) + "\n\n");
-    const finished = times.length === 3;
-    const text = [blocked, "Reading the UI file.", "Done."][times.length - 1];
-    send({ id: "test-reply", object: "chat.completion.chunk", created: 1, model: "mock",
-      choices: [{ index: 0, delta: { role: "assistant", content: text }, finish_reason: finished ? "stop" : null }] });
-    if (finished) res.end("data: [DONE]\n\n");
-    else {
-      send({ error: { type: "api_error", message: truncated } });
-      res.end();
+test("Gemini filter + Antigravity cutoff injects a visible self-check prompt before retrying", async t => {
+  const s = await openSession(t);
+  const sensitiveDraft = "RAW_SENSITIVE_DRAFT_SNIPPET";
+  s.reply = n => n === 1
+    ? failure(truncated, [
+      { type: "thinking", thinking: sensitiveDraft },
+      { type: "text", text: geminiFilterBanner },
+    ])
+    : success;
+  const tick = clock(t);
+  const done = s.session.prompt("Audit the auth parser");
+  await until(() => s.row().includes("[1/10]"));
+  assert.match(s.row(), /\[Cancel\].*Filter blocked · self-check in 10s · Esc/);
+  await tick(10000);
+  await done;
+
+  assert.equal(s.calls.length, 2);
+  const retryMessages = s.calls[1].messages;
+  const serialized = JSON.stringify(retryMessages);
+  // Neither the blocked banner nor raw draft thinking is echoed back into context.
+  assert.ok(!serialized.includes("blocked by Gemini's filters"));
+  assert.ok(!serialized.includes(sensitiveDraft));
+  // Model receives a self-check instruction diagnosing the mid-generation output filter.
+  const selfCheckMsg = retryMessages.at(-1);
+  assert.equal(selfCheckMsg.role, "user");
+  const selfCheckText = JSON.stringify(selfCheckMsg.content);
+  assert.match(selfCheckText, /Auto-Retry Filter Self-Check 1\/10/);
+  assert.match(selfCheckText, /Gemini's content filter/);
+  assert.match(selfCheckText, /mid-generation \(reasoning\)/);
+
+  // Persisted as a visible custom_message in session history.
+  const customEntries = s.session.sessionManager.getBranch().filter(e => e.type === "custom_message" && e.customType === "pi-auto-retry");
+  assert.equal(customEntries.length, 1);
+  assert.equal(customEntries[0].display, true);
+});
+
+test("consecutive Gemini filter blocks progressively fold raw tool outputs without breaking toolCall pairing", async t => {
+  const rawPayload = "FLAGGED_PAYLOAD_LITERAL_LINE_1\nFLAGGED_PAYLOAD_LITERAL_LINE_2";
+  const readTool = {
+    name: "read_sample",
+    label: "Read Sample",
+    description: "Read sample payload file",
+    parameters: Type.Object({}),
+    async execute() {
+      return { content: [{ type: "text", text: rawPayload }], details: {} };
+    },
+  };
+  const s = await openSession(t, { tools: [readTool] });
+  s.reply = n => {
+    if (n === 1) {
+      return { stopReason: "toolUse", content: [{ type: "toolCall", id: "call_read_1", name: "read_sample", arguments: {} }] };
     }
+    if (n === 2 || n === 3) {
+      return failure(truncated, [{ type: "text", text: geminiFilterBanner }]);
+    }
+    return success;
+  };
+  const tick = clock(t);
+  const done = s.session.prompt("Inspect sample file");
+
+  // First filter block (call #2): keeps toolResult raw content and injects self-check #1.
+  await until(() => s.row().includes("[1/10]"));
+  await tick(10000);
+
+  // Second consecutive filter block (call #3): folds raw toolResult content and replaces self-check #1 with #2.
+  await until(() => s.row().includes("[2/10]"));
+  await tick(10000);
+  await done;
+
+  assert.equal(s.calls.length, 4);
+  // Attempt 1 (call #3) kept raw tool output to let model adjust its own reply first.
+  assert.ok(JSON.stringify(s.calls[2].messages).includes("FLAGGED_PAYLOAD_LITERAL_LINE_1"));
+
+  // Attempt 2 (call #4) folded the raw tool output while preserving the paired toolResult message.
+  const finalCallMessages = s.calls[3].messages;
+  assert.ok(!JSON.stringify(finalCallMessages).includes("FLAGGED_PAYLOAD_LITERAL_LINE_1"));
+  const toolResultMsg = finalCallMessages.find(m => m.role === "toolResult");
+  assert.equal(toolResultMsg?.toolCallId, "call_read_1");
+  assert.match(JSON.stringify(toolResultMsg.content), /raw tool output omitted \(read_sample, 2 lines/);
+
+  // Superseded self-check #1 was omitted so self-check prompts do not stack up.
+  const selfChecksInContext = finalCallMessages.filter(
+    m => m.role === "user" && JSON.stringify(m.content).includes("Auto-Retry Filter Self-Check"),
+  );
+  assert.equal(selfChecksInContext.length, 1);
+  assert.match(JSON.stringify(selfChecksInContext[0].content), /Auto-Retry Filter Self-Check 2\/10/);
+  assert.match(JSON.stringify(selfChecksInContext[0].content), /read_sample/);
+});
+
+test("persistent filter blocks after folding tool output omit the offending tool-call turn pair and recover", async t => {
+  const writeTool = {
+    name: "write_sample",
+    label: "Write Sample",
+    description: "Write sample file",
+    parameters: Type.Object({ body: Type.String() }),
+    async execute() {
+      return { content: [{ type: "text", text: "wrote file" }], details: {} };
+    },
+  };
+  const s = await openSession(t, { tools: [writeTool] });
+  const flaggedArg = "FLAGGED_INLINE_TOOL_ARGUMENT";
+  s.reply = n => {
+    if (n === 1) {
+      return {
+        stopReason: "toolUse",
+        content: [{ type: "toolCall", id: "call_write_1", name: "write_sample", arguments: { body: flaggedArg } }],
+      };
+    }
+    if (n >= 2 && n <= 4) {
+      return failure(truncated, [{ type: "text", text: geminiFilterBanner }]);
+    }
+    return success;
+  };
+  const tick = clock(t);
+  const done = s.session.prompt("Create test fixture");
+
+  for (let n = 1; n <= 3; n++) {
+    await until(() => s.row().includes("[" + n + "/10]"));
+    await tick(10000);
+  }
+  await done;
+
+  assert.equal(s.calls.length, 5);
+  const lastMessages = s.calls[4].messages;
+  assert.ok(!JSON.stringify(lastMessages).includes(flaggedArg));
+  assert.equal(lastMessages.filter(m => m.role === "toolResult").length, 0);
+  assert.match(JSON.stringify(lastMessages.at(-1).content), /Auto-Retry Filter Self-Check 3\/10/);
+  assert.match(JSON.stringify(lastMessages.at(-1).content), /write_sample/);
+});
+
+test("filter self-check retries stop at the configured limit and notify the user", async t => {
+  const s = await openSession(t);
+  await s.session.prompt("/retry 2");
+  s.reply = () => failure(truncated, [{ type: "text", text: geminiFilterBanner }]);
+  const tick = clock(t);
+  const done = s.session.prompt("Run security check");
+
+  await until(() => s.row().includes("[1/2]"));
+  await tick(10000);
+  await until(() => s.row().includes("[2/2]"));
+  await tick(10000);
+  await done;
+
+  assert.equal(s.calls.length, 3);
+  assert.ok(s.notices.includes("Retry limit reached (2/2). The provider blocked this request."));
+});
+
+test("cancelling a pending filter self-check countdown leaves no self-check message in history", async t => {
+  const s = await openSession(t);
+  s.reply = () => failure(truncated, [{ type: "text", text: geminiFilterBanner }]);
+  const tick = clock(t);
+  const done = s.session.prompt("Inspect query");
+  await until(() => s.row().includes("[1/10]"));
+  assert.equal(s.key("\x1b")?.consume, true);
+  await done;
+  await tick(15000);
+  assert.equal(s.calls.length, 1);
+  const customEntries = s.session.sessionManager.getBranch().filter(e => e.type === "custom_message");
+  assert.equal(customEntries.length, 0);
+});
+
+test("native retryable status combined with SAFETY stop reason still injects self-check", async t => {
+  const s = await openSession(t);
+  s.reply = n => n === 1 ? { ...failure("503 gateway"), rawStopReason: "SAFETY" } : success;
+  const tick = clock(t);
+  const done = s.session.prompt("Check handler");
+  await until(() => s.row().includes("[1/10]"));
+  await tick(10000);
+  await done;
+  assert.equal(s.calls.length, 2);
+  assert.match(JSON.stringify(s.calls[1].messages), /Auto-Retry Filter Self-Check 1\/10/);
+  assert.match(JSON.stringify(s.calls[1].messages), /SAFETY/);
+});
+
+test("HTTP 200 with a Gemini block self-checks then recovers across an ordinary stream cutoff", { timeout: 10000 }, async t => {
+  const times = [];
+  const bodies = [];
+  const server = createServer((req, res) => {
+    const chunks = [];
+    req.on("data", chunk => chunks.push(chunk));
+    req.on("end", () => {
+      bodies.push(Buffer.concat(chunks).toString("utf8"));
+      times.push(Date.now());
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      const send = data => res.write("data: " + JSON.stringify(data) + "\n\n");
+      const finished = times.length === 3;
+      const text = [geminiFilterBanner, "Reading the UI file.", "Done."][times.length - 1];
+      send({ id: "test-reply", object: "chat.completion.chunk", created: 1, model: "mock",
+        choices: [{ index: 0, delta: { role: "assistant", content: text }, finish_reason: finished ? "stop" : null }] });
+      if (finished) res.end("data: [DONE]\n\n");
+      else {
+        send({ error: { type: "api_error", message: truncated } });
+        res.end();
+      }
+    });
   });
   await new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -296,22 +476,24 @@ test("HTTP 200 with a Gemini block reports 0/20, while an ordinary stream cutoff
     native: { provider: { maxRetries: 0 } } });
   await s.session.prompt("/retry 20");
   const tick = clock(t);
-  await s.session.prompt("Continue");
-  await tick(30000);
-  assert.equal(times.length, 1);
-  assert.equal(s.row(), "");
-  assert.equal(s.nativeStarts.length, 0);
-  assert.deepEqual(s.notices.filter(n => n.includes("Auto-retry stopped")), [
-    "Auto-retry stopped [0/20]. The provider blocked this request.",
-  ]);
+  const done = s.session.prompt("Continue");
 
-  // The previous refusal is still in the transcript. The next request's own
-  // error must decide whether to retry.
-  const next = s.session.prompt("Change the button label");
+  // Attempt 1: Gemini filter block -> self-check countdown.
   await until(() => s.row().includes("[1/20]"));
+  assert.match(s.row(), /Filter blocked · self-check in 10s/);
   await tick(10000);
-  await next;
+
+  // Attempt 2: Ordinary Antigravity stream cutoff -> normal retry countdown.
+  await until(() => s.row().includes("[2/20]"));
+  assert.match(s.row(), /\[Cancel\]  Retrying in 10s/);
+  await tick(10000);
+
+  await done;
   assert.equal(times.length, 3);
-  assert.equal(times[2] - times[1], 10000);
+  assert.equal(s.row(), "");
+  assert.ok(!bodies[1].includes("blocked by Gemini's filters"));
+  assert.match(bodies[1], /Auto-Retry Filter Self-Check 1\/20/);
+  assert.ok(!bodies[2].includes("Reading the UI file."));
+  assert.match(bodies[2], /Auto-Retry Filter Self-Check 1\/20/);
   assert.equal(s.session.messages.at(-1).stopReason, "stop");
 });

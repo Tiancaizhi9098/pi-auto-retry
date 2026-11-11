@@ -24,9 +24,13 @@ Enter `/retry`, choose **Set retry limit**, type a whole number, and press **Ent
 
 ## What gets retried
 
-The extension handles network disconnects, timeouts, temporary rate limits and server errors, including an HTTP 200 stream that ends with `Antigravity: the reply ended before it was complete`. Exhausted quota and invalid credentials end the request.
+The extension handles network disconnects, timeouts, temporary rate limits and server errors, including an HTTP 200 stream that ends with `Antigravity: the reply ended before it was complete`. Exhausted quota and invalid credentials end the request immediately.
 
-If the same reply also says that the provider blocked the request, Pi shows `Auto-retry stopped [0/20]. The provider blocked this request.` The first number counts retries already sent for that request. The second is your configured limit. A later request that loses its connection gets its own retry allowance.
+When a reply is blocked by Gemini or provider content filters (for example `This request was blocked by Gemini's filters...` followed by `Antigravity: the reply ended before it was complete`, or a `SAFETY` / `PROHIBITED_CONTENT` / `content_filter` stop reason), Pi does **not** blindly resend the identical request:
+
+1. **First filter block:** Omits the blocked assistant reply from model context and injects a visible `[Auto-Retry · Filter Self-Check]` message asking the model to inspect what in recent context, tool usage, or its own generated wording/reasoning triggered the false positive, adjust to concise neutral technical phrasing or targeted tool steps, and continue.
+2. **Consecutive filter blocks:** If the immediate retry is blocked again (indicating raw data already in context triggered an input filter), Pi progressively replaces the most recent raw `toolResult` batch with a compact metadata placeholder while preserving `toolCall` pairing—and if blocks still persist, omits the offending tool-call turn pair—so the model can re-inspect files selectively via narrow line ranges or local scripts.
+3. Shares the configured `/retry` limit, 10-second countdown, and `[Cancel]` / `Esc` / `/retry cancel` controls.
 
 Pi continues from the failed model call. Completed tool results stay in the conversation. Pi's built-in agent retries count towards the same limit. With default Pi settings, retries start at ten-second intervals. If you manually configured longer Pi agent backoff, set `retry.maxAgentDelayMs` to `10000` in Pi's settings to use the same interval.
 

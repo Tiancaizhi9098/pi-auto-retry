@@ -2,10 +2,19 @@ import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { isKeyRelease, matchesKey } from "@earendil-works/pi-tui";
 import { DEFAULT_LIMIT, parseLimit, readLimit, writeLimit } from "./preferences.js";
-import { continuation, DELAY_MS, retryPolicy, waitForDelay } from "./retry.js";
-import { retryWidget } from "./widget.js";
+import {
+  buildSelfCheckPrompt,
+  continuation,
+  DELAY_MS,
+  retryPolicy,
+  sanitizeMessagesForNativeRetry,
+  SELF_CHECK_TYPE,
+  waitForDelay,
+} from "./retry.js";
+import { renderSelfCheckMessage, retryWidget } from "./widget.js";
 
 const key = "pi-auto-retry";
+const isInteractive = mode => mode === "tui" || mode === "interactive";
 
 export default function autoRetry(pi) {
   const path = join(getAgentDir(), "pi-auto-retry.json");
@@ -14,13 +23,15 @@ export default function autoRetry(pi) {
   let nativeUsed = 0;
   let dialogs = 0;
 
+  pi.registerMessageRenderer(SELF_CHECK_TYPE, renderSelfCheckMessage);
+
   function clearAttempt() {
     const old = active;
     if (!old) return;
     active = undefined;
     old.controller.abort();
     old.offKey?.();
-    if (old.ctx.mode === "interactive") old.ctx.ui.setWidget(key, undefined);
+    if (isInteractive(old.ctx.mode)) old.ctx.ui.setWidget(key, undefined);
     if (old.ctx.mode === "rpc") old.ctx.ui.setStatus(key, undefined);
   }
 
@@ -40,9 +51,10 @@ export default function autoRetry(pi) {
   function show(attempt) {
     const { ctx } = attempt;
     if (ctx.mode === "rpc") {
-      ctx.ui.setStatus(key, "[" + attempt.number + "/" + limit + "]  /retry cancel");
+      const modeLabel = attempt.selfCheck ? "self-check · " : "";
+      ctx.ui.setStatus(key, "[" + attempt.number + "/" + limit + "]  " + modeLabel + "/retry cancel");
     }
-    if (ctx.mode !== "interactive") return;
+    if (!isInteractive(ctx.mode)) return;
     const cancelThis = () => active === attempt && cancel(ctx);
     ctx.ui.setWidget(key, (tui, theme) => retryWidget(tui, theme, attempt, () => limit, cancelThis));
     attempt.offKey = ctx.ui.onTerminalInput(data => {
@@ -71,28 +83,69 @@ export default function autoRetry(pi) {
   pi.on("agent_start", () => {
     if (!active || active.running) return;
     active.running = true;
-    if (active.native) nativeUsed++;
+    if (active.native) {
+      nativeUsed++;
+      if (active.selfCheck) {
+        const content = buildSelfCheckPrompt({
+          attemptNumber: active.number,
+          limit,
+          filterStreak: active.filterStreak,
+          clue: active.clue,
+          redactedTools: [],
+          omittedTurnTools: [],
+        });
+        pi.sendMessage({
+          customType: SELF_CHECK_TYPE,
+          content,
+          display: true,
+          details: {
+            attempt: active.number,
+            limit,
+            filterStreak: active.filterStreak,
+            stage: active.clue?.stage ?? "request",
+            reason: active.clue?.reason ?? "provider content filter",
+            redactedTools: [],
+            omittedTurnTools: [],
+          },
+        }, { deliverAs: "steer" });
+      }
+    }
     active.redraw?.();
+  });
+
+  pi.on("context", event => {
+    if (!active?.running || !active.native || !active.selfCheck) return;
+    return { messages: sanitizeMessagesForNativeRetry(event.messages, active.filterStreak) };
   });
 
   pi.on("turn_end", async (event, ctx) => {
     const policy = retryPolicy(event.message, ctx.model, pi.getSettings().retry, nativeUsed);
     const used = active?.number ?? 0;
+    const prevFilterStreak = active?.filterStreak ?? 0;
     const series = active?.series ?? Symbol();
     clearAttempt();
     if (!policy.retry || used >= limit || ctx.signal?.aborted) {
       nativeUsed = 0;
-      if (policy.providerBlocked && limit > 0 && !ctx.signal?.aborted) {
-        ctx.ui.notify("Auto-retry stopped [" + used + "/" + limit + "]. The provider blocked this request.", "warning");
+      if (policy.retry && used && used >= limit && !ctx.signal?.aborted) {
+        const suffix = policy.providerBlocked ? " The provider blocked this request." : "";
+        ctx.ui.notify("Retry limit reached (" + used + "/" + limit + ")." + suffix, "warning");
       }
-      if (policy.retry && used && used >= limit) ctx.ui.notify("Retry limit reached (" + used + "/" + limit + ").", "warning");
       if (policy.native && (!policy.retry || used >= limit)) ctx.abort();
       return;
     }
 
     const attempt = {
-      number: used + 1, series, targetId: event.messageEntryId, ctx,
-      native: policy.native, running: false, controller: new AbortController(),
+      number: used + 1,
+      series,
+      targetId: event.messageEntryId,
+      turnToolResultIds: event.toolResultEntryIds ?? [],
+      selfCheck: Boolean(policy.selfCheck),
+      filterStreak: policy.selfCheck ? prevFilterStreak + 1 : prevFilterStreak,
+      clue: policy.clue,
+      ctx,
+      native: policy.native,
+      running: false,
+      controller: new AbortController(),
       deadline: Date.now() + Math.max(DELAY_MS, policy.delay),
     };
     active = attempt;
@@ -114,7 +167,7 @@ export default function autoRetry(pi) {
     // was cancelled. Only complete attempts which Pi handed back to us.
     if (!active || active.native || active.running || ctx.hasPendingMessages()) return;
     nativeUsed = 0;
-    return continuation(event, active.targetId);
+    return continuation(event, active, limit);
   });
 
   function setLimit(value, ctx) {
