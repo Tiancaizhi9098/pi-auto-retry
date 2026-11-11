@@ -1,6 +1,6 @@
 {
   "name": "pi-auto-retry",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Cancellable automatic retries for ordinary Pi conversations",
   "type": "module",
   "license": "MIT",

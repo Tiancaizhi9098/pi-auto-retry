@@ -24,7 +24,9 @@ Enter `/retry`, choose **Set retry limit**, type a whole number, and press **Ent
 
 ## What gets retried
 
-The extension handles network disconnects, timeouts, temporary rate limits and server errors, including the Antigravity gateway error `the reply ended before it was complete`. Explicit provider rejections, exhausted quota and invalid credentials end the request. If Gemini explicitly reports that its filters blocked the request, that decision takes precedence over a gateway truncation message.
+The extension handles network disconnects, timeouts, temporary rate limits and server errors, including an HTTP 200 stream that ends with `Antigravity: the reply ended before it was complete`. Exhausted quota and invalid credentials end the request.
+
+If the same reply also says that the provider blocked the request, Pi shows `Auto-retry stopped [0/20]. The provider blocked this request.` The first number counts retries already sent for that request. The second is your configured limit. A later request that loses its connection gets its own retry allowance.
 
 Pi continues from the failed model call. Completed tool results stay in the conversation. Pi's built-in agent retries count towards the same limit. With default Pi settings, retries start at ten-second intervals. If you manually configured longer Pi agent backoff, set `retry.maxAgentDelayMs` to `10000` in Pi's settings to use the same interval.
 

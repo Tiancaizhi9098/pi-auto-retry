@@ -82,6 +82,9 @@ export default function autoRetry(pi) {
     clearAttempt();
     if (!policy.retry || used >= limit || ctx.signal?.aborted) {
       nativeUsed = 0;
+      if (policy.providerBlocked && limit > 0 && !ctx.signal?.aborted) {
+        ctx.ui.notify("Auto-retry stopped [" + used + "/" + limit + "]. The provider blocked this request.", "warning");
+      }
       if (policy.retry && used && used >= limit) ctx.ui.notify("Retry limit reached (" + used + "/" + limit + ").", "warning");
       if (policy.native && (!policy.retry || used >= limit)) ctx.abort();
       return;

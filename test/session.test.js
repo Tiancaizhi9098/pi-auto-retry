@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -28,7 +29,7 @@ async function openSession(t, options = {}) {
   const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false }, retry: options.native });
   const runtime = await ModelRuntime.create({ credentials: AuthStorage.inMemory(), modelsPath: null, refreshOnCreate: false, modelsStorePath: join(dir, "models-cache.json") });
   runtime.registerProvider("retry-test", {
-    api: "openai-completions", baseUrl: "http://127.0.0.1:1/unused", apiKey: "offline",
+    api: "openai-completions", baseUrl: options.baseUrl ?? "http://127.0.0.1:1/unused", apiKey: "offline",
     models: [{ id: "mock", name: "Mock", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 1000 }],
   });
   const loader = new DefaultResourceLoader({ cwd: dir, agentDir: dir, settingsManager, noExtensions: true,
@@ -53,7 +54,7 @@ async function openSession(t, options = {}) {
   };
   await session.bindExtensions({ mode: "interactive", uiContext: ui, onError: error => state.errors.push(error) });
   session.subscribe(event => { if (event.type === "auto_retry_start") state.nativeStarts.push(event); });
-  session.agent.streamFunction = (model, context, streamOptions) => {
+  const mockStream = (model, context, streamOptions) => {
     state.calls.push({ time: Date.now(), messages: structuredClone(context.messages) });
     const stream = createAssistantMessageEventStream();
     queueMicrotask(async () => {
@@ -69,6 +70,7 @@ async function openSession(t, options = {}) {
     });
     return stream;
   };
+  if (!options.baseUrl) session.agent.streamFunction = mockStream;
   t.after(async () => {
     await session.abort();
     session.dispose();
@@ -262,4 +264,54 @@ test("explicit provider rejections, credentials, and success settle immediately"
   }
   assert.equal(s.calls.length, before + 5);
   assert.equal(s.nativeStarts.length, 0);
+});
+
+test("HTTP 200 with a Gemini block reports 0/20, while an ordinary stream cutoff retries", { timeout: 10000 }, async t => {
+  const times = [];
+  const blocked = "This request was blocked by Gemini's filters. Please try rephrasing your prompt.";
+  const server = createServer((req, res) => {
+    req.resume();
+    times.push(Date.now());
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    const send = data => res.write("data: " + JSON.stringify(data) + "\n\n");
+    const finished = times.length === 3;
+    const text = [blocked, "Reading the UI file.", "Done."][times.length - 1];
+    send({ id: "test-reply", object: "chat.completion.chunk", created: 1, model: "mock",
+      choices: [{ index: 0, delta: { role: "assistant", content: text }, finish_reason: finished ? "stop" : null }] });
+    if (finished) res.end("data: [DONE]\n\n");
+    else {
+      send({ error: { type: "api_error", message: truncated } });
+      res.end();
+    }
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  t.after(() => {
+    server.closeAllConnections();
+    return new Promise(resolve => server.close(resolve));
+  });
+  const s = await openSession(t, { baseUrl: "http://127.0.0.1:" + server.address().port + "/v1",
+    native: { provider: { maxRetries: 0 } } });
+  await s.session.prompt("/retry 20");
+  const tick = clock(t);
+  await s.session.prompt("Continue");
+  await tick(30000);
+  assert.equal(times.length, 1);
+  assert.equal(s.row(), "");
+  assert.equal(s.nativeStarts.length, 0);
+  assert.deepEqual(s.notices.filter(n => n.includes("Auto-retry stopped")), [
+    "Auto-retry stopped [0/20]. The provider blocked this request.",
+  ]);
+
+  // The previous refusal is still in the transcript. The next request's own
+  // error must decide whether to retry.
+  const next = s.session.prompt("Change the button label");
+  await until(() => s.row().includes("[1/20]"));
+  await tick(10000);
+  await next;
+  assert.equal(times.length, 3);
+  assert.equal(times[2] - times[1], 10000);
+  assert.equal(s.session.messages.at(-1).stopReason, "stop");
 });

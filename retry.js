@@ -3,7 +3,8 @@ import { isContextOverflow, isRetryableAssistantError } from "@earendil-works/pi
 export const DELAY_MS = 10_000;
 
 const disconnected = /\b(?:ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|UND_ERR_SOCKET|ERR_STREAM_PREMATURE_CLOSE|unexpected EOF)\b|\bthe reply ended before it was complete\b/i;
-const permanent = /\b(?:content[_ -]?filter(?:ed)?|content[_ -]?policy[_ -]?violation|prompt[_ -]?blocked|PROHIBITED_CONTENT|unauthorized|forbidden|invalid[_ -]?api[_ -]?key|authentication[_ -]?error|invalid[_ -]?request(?:[_ -]?error)?|insufficient[_ -]?quota|quota exceeded|billing|out of budget)\b|(?:^|\bHTTP\s+)(?:400|401|403)\b/i;
+const filterError = /\b(?:content[_ -]?filter(?:ed)?|content[_ -]?policy[_ -]?violation|prompt[_ -]?blocked|PROHIBITED_CONTENT)\b/i;
+const permanent = /\b(?:unauthorized|forbidden|invalid[_ -]?api[_ -]?key|authentication[_ -]?error|invalid[_ -]?request(?:[_ -]?error)?|insufficient[_ -]?quota|quota exceeded|billing|out of budget)\b|(?:^|\bHTTP\s+)(?:400|401|403)\b/i;
 const terminalReason = /^(?:safety|content_filter|prohibited_content|blocklist|recitation|refusal)$/i;
 const rejectionBanner = /^\s*(?:this |your |the )?request (?:was|has been) blocked by .{0,80}\b(?:filters?|safety policy)\b/im;
 
@@ -14,13 +15,15 @@ export function retryPolicy(message, model, policy, nativeUsed) {
   const error = message.errorMessage ?? "";
   const nativeEligible = isRetryableAssistantError(message);
   const native = nativeEligible && (policy?.enabled ?? true) && nativeUsed < (policy?.maxRetries ?? 3);
-  const rejected = terminalReason.test(message.rawStopReason ?? "") || permanent.test(error) || rejectionBanner.test(error) || message.content?.some(
-    part => part.type === "text" && rejectionBanner.test(part.text)
-  );
+  const providerBlocked = terminalReason.test(message.rawStopReason ?? "")
+    || filterError.test(error)
+    || rejectionBanner.test(error)
+    || message.content?.some(part => part.type === "text" && rejectionBanner.test(part.text));
+  if (providerBlocked) return { retry: false, native, providerBlocked: true };
   const delay = native
     ? Math.min((policy?.baseDelayMs ?? 2000) * 2 ** nativeUsed, policy?.maxAgentDelayMs ?? 60_000)
     : 0;
-  return { retry: !rejected && (nativeEligible || disconnected.test(error)), native, delay };
+  return { retry: !permanent.test(error) && (nativeEligible || disconnected.test(error)), native, delay };
 }
 
 // The session keeps its raw transcript. The context edit skips only the failed
