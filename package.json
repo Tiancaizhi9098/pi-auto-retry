@@ -1,0 +1,22 @@
+{
+  "name": "pi-auto-retry",
+  "version": "1.0.0",
+  "description": "Cancellable automatic retries for ordinary Pi conversations",
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["pi-package", "pi-extension", "retry"],
+  "repository": "github:Tiancaizhi9098/pi-auto-retry",
+  "engines": { "node": ">=22.19.0" },
+  "pi": { "extensions": ["./index.js"] },
+  "scripts": { "test": "node --test test/*.test.js" },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=1.5.2 <2",
+    "@earendil-works/pi-coding-agent": ">=1.5.2 <2",
+    "@earendil-works/pi-tui": ">=1.5.2 <2"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "1.5.2",
+    "@earendil-works/pi-coding-agent": "1.5.2",
+    "@earendil-works/pi-tui": "1.5.2"
+  }
+}
